@@ -136,6 +136,10 @@ def main(cfg: DictConfig):
             attn_pdrop=cfg.dropout,
             bias=False,
         )
+        # Extra attributes for FFN type and MoE
+        config.ffn_type = cfg.ffn_type
+        config.num_experts_total = cfg.num_experts_total
+        config.num_experts_activated = cfg.num_experts_activated
         if model_type == ModelType.ENC_DECODER:
             encoder_config = BertConfig(
                 vocab_size=vocab_size,
@@ -158,7 +162,15 @@ def main(cfg: DictConfig):
 
         if master_process:
             logger.info(f"Initializing a new model from scratch: {config}")
-    logger.info(f"Model parameters: {raw_model.num_parameters() / 1e6:.2f}M")
+
+    use_moe = getattr(raw_model, "use_moe", False)
+    num_params_total = raw_model.num_parameters()
+    num_params_active = raw_model.num_active_parameters()
+    if master_process:
+        logger.info(
+            f"Model parameters — total: {num_params_total / 1e6:.2f}M, "
+            f"active (per token): {num_params_active / 1e6:.2f}M"
+        )
 
     raw_model.to(device)
     # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -170,11 +182,14 @@ def main(cfg: DictConfig):
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
 
-    num_params = raw_model.num_parameters()
+    num_params = num_params_active
+    # Disable torch.compile when using MoE (DeepSpeed MoE is not compatible with torch.compile)
+    no_compile = cfg.no_compile or use_moe
     if master_process:
-        logger.info(f"Number of parameters: {num_params / 1e6:.2f}M")
-        logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
-    model = th.compile(raw_model, disable=cfg.no_compile)
+        if use_moe and not cfg.no_compile:
+            logger.info("Disabling torch.compile because MoE is enabled.")
+        logger.info(("Not c" if no_compile else "C") + "ompiling the model...")
+    model = th.compile(raw_model, disable=no_compile)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -191,8 +206,9 @@ def main(cfg: DictConfig):
                 "dataset": dataset_name,
                 "vocab_size": len(vocab),
                 "vocab_size_train": vocab_size,
-                "model_num_params": num_params,
-                "model_num_params_total": raw_model.num_parameters(exclude_embeddings=False),
+                "model_num_params_active": num_params_active,
+                "model_num_params_total": num_params_total,
+                "model_num_params_total_with_emb": raw_model.num_parameters(exclude_embeddings=False),
             }
         )
         run_id = wandb_path.split("/")[-1] if wandb_path is not None else None
@@ -285,6 +301,9 @@ def main(cfg: DictConfig):
                 else:
                     output = model(input_ids=X, labels=Y)
                 loss = output.loss
+                # Add MoE auxiliary load-balancing loss if applicable
+                if use_moe and hasattr(output, "moe_loss"):
+                    loss = loss + cfg.moe_aux_loss_weight * output.moe_loss
                 loss = (
                     loss / cfg.gradient_accumulation_steps
                 )  # scale the loss to account for gradient accumulation

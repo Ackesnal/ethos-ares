@@ -8,7 +8,7 @@ import transformers.activations
 from torch.nn import functional as F
 from transformers import GPT2Config
 
-ModelOutput = namedtuple("ModelOutput", ["loss", "logits"])
+ModelOutput = namedtuple("ModelOutput", ["loss", "logits", "moe_loss"])
 
 
 class CausalSelfAttention(nn.Module):
@@ -90,18 +90,81 @@ class MLP(nn.Module):
         return x
 
 
+class GLU(nn.Module):
+    """Gated Linear Unit FFN: uses a gating mechanism where one linear projection
+    controls the gate and another provides the value, followed by a down-projection."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.w_gate = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.w_up = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.activation = transformers.activations.get_activation(config.activation_function)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.resid_pdrop)
+
+    def forward(self, x):
+        gate = self.activation(self.w_gate(x))
+        up = self.w_up(x)
+        x = gate * up
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+
+def _build_ffn(config):
+    """Build the FFN module based on config.ffn_type ('mlp' or 'glu')."""
+    ffn_type = getattr(config, "ffn_type", "mlp")
+    if ffn_type == "glu":
+        return GLU(config)
+    return MLP(config)
+
+
 class Block(nn.Module):
     def __init__(self, config, attention_weights: list | None = None):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd, bias=config.bias)
         self.attn = CausalSelfAttention(config, attention_weights=attention_weights)
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
+
+        num_experts = getattr(config, "num_experts_total", 1)
+        num_experts_activated = getattr(config, "num_experts_activated", 1)
+
+        if num_experts > 1:
+            from deepspeed.moe.layer import MoE
+
+            expert = _build_ffn(config)
+            self.moe = MoE(
+                hidden_size=config.n_embd,
+                expert=expert,
+                num_experts=num_experts,
+                ep_size=1,  # will be overridden by DeepSpeed engine when distributed
+                k=num_experts_activated,
+                use_residual=False,
+                capacity_factor=1.0,
+                eval_capacity_factor=1.0,
+                min_capacity=4,
+                drop_tokens=True,
+                use_tutel=False,
+                noisy_gate_policy=None,
+            )
+            self.use_moe = True
+        else:
+            self.mlp = _build_ffn(config)
+            self.use_moe = False
 
     def forward(self, x):
         x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
+        residual = x
+        x = self.ln_2(x)
+        if self.use_moe:
+            # DeepSpeed MoE expects (batch*seq, hidden) or (batch, seq, hidden)
+            # It returns (output, moe_loss, _)
+            x, moe_loss, _ = self.moe(x)
+            x = residual + x
+            return x, moe_loss
+        else:
+            x = residual + self.mlp(x)
+            return x, torch.tensor(0.0, device=x.device)
 
 
 class GPT2LMNoBiasModel(nn.Module):
@@ -112,6 +175,7 @@ class GPT2LMNoBiasModel(nn.Module):
     ):
         super().__init__()
         self.config = config
+        self.use_moe = getattr(config, "num_experts_total", 1) > 1
 
         self.return_attention = return_attention
         self.attention_weights = [] if return_attention else None
@@ -150,10 +214,42 @@ class GPT2LMNoBiasModel(nn.Module):
 
     @lru_cache
     def num_parameters(self, exclude_embeddings=True):
+        """Total number of parameters (all experts counted)."""
         n_params = sum(p.numel() for p in self.parameters())
         if exclude_embeddings:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
+
+    @lru_cache
+    def num_active_parameters(self, exclude_embeddings=True):
+        """Number of parameters activated per token (for MoE, only the activated experts count).
+
+        For non-MoE models this equals num_parameters(). For MoE models, each layer's FFN
+        contribution is scaled by (num_experts_activated / num_experts_total)."""
+        if not self.use_moe:
+            return self.num_parameters(exclude_embeddings)
+
+        num_experts = getattr(self.config, "num_experts_total", 1)
+        num_activated = getattr(self.config, "num_experts_activated", 1)
+
+        # Sum non-expert parameters
+        expert_params_per_layer = 0
+        non_expert_params = 0
+        for name, p in self.named_parameters():
+            if ".moe." in name and ".deepspeed_moe.experts." in name:
+                # This is an expert parameter; count per-layer once
+                expert_params_per_layer += p.numel()
+            else:
+                non_expert_params += p.numel()
+
+        if exclude_embeddings:
+            non_expert_params -= self.transformer.wpe.weight.numel()
+
+        # expert_params_per_layer counts ALL expert params across ALL layers
+        # Each layer has num_experts copies; activated params = total_expert / num_experts * num_activated
+        active_expert_params = expert_params_per_layer // num_experts * num_activated
+
+        return non_expert_params + active_expert_params
 
     def forward(self, input_ids, labels=None) -> ModelOutput:
         _, t = input_ids.size()
@@ -163,8 +259,12 @@ class GPT2LMNoBiasModel(nn.Module):
         tok_emb = self.transformer.wte(input_ids)
         pos_emb = self.transformer.wpe(self.pos[:t])
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        total_moe_loss = torch.tensor(0.0, device=input_ids.device)
         for block in self.transformer.h:
-            x = block(x)
+            x, moe_loss = block(x)
+            total_moe_loss = total_moe_loss + moe_loss
+
         x = self.transformer.ln_f(x)
 
         if labels is not None:
@@ -174,7 +274,7 @@ class GPT2LMNoBiasModel(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
 
-        return ModelOutput(loss=loss, logits=logits)
+        return ModelOutput(loss=loss, logits=logits, moe_loss=total_moe_loss)
 
     @torch.no_grad()
     def get_next_token(self, x: torch.Tensor, return_probs: bool = False, top_k: int | None = None):

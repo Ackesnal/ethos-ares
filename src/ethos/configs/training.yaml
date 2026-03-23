@@ -19,6 +19,11 @@ n_head: 4
 n_embd: 64
 dropout: 0
 activation: "gelu"
+ffn_type: "mlp" # "mlp" or "glu"
+# Mixture-of-Experts parameters
+num_experts_total: 1 # Total number of experts. 1 = no MoE (standard Transformer)
+num_experts_activated: 1 # Number of experts activated per token (top-k)
+moe_aux_loss_weight: 0.01 # Weight for the MoE auxiliary load-balancing loss
 # optimizer parameters
 max_iters: 100000
 lr: 0.0006 # Learning rate
