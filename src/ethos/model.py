@@ -119,6 +119,103 @@ def _build_ffn(config):
     return MLP(config)
 
 
+class TopKRouter(nn.Module):
+    """Top-k gating router for Mixture-of-Experts.
+
+    Computes a softmax over expert logits and selects the top-k experts per token.
+    Also computes an auxiliary load-balancing loss (Switch Transformer style).
+    """
+
+    def __init__(self, hidden_size: int, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.gate = nn.Linear(hidden_size, num_experts, bias=False)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Args:
+            x: (num_tokens, hidden_size)
+        Returns:
+            top_k_weights: (num_tokens, top_k)  — normalized routing weights
+            top_k_indices: (num_tokens, top_k)  — expert indices
+            aux_loss: scalar — load-balancing auxiliary loss
+        """
+        # (num_tokens, num_experts)
+        logits = self.gate(x)
+        probs = F.softmax(logits, dim=-1)
+
+        top_k_weights, top_k_indices = torch.topk(probs, self.top_k, dim=-1)
+        # Re-normalize the selected weights so they sum to 1
+        top_k_weights = top_k_weights / (top_k_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # --- Auxiliary load-balancing loss (Switch Transformer, Eq. 4) ---
+        # f_i = fraction of tokens routed to expert i (based on argmax / top-1)
+        # P_i = mean probability assigned to expert i
+        # loss = num_experts * sum(f_i * P_i)
+        num_tokens = x.size(0)
+        # Count how many tokens each expert is the top-1 choice for
+        top1_indices = top_k_indices[:, 0]  # (num_tokens,)
+        tokens_per_expert = torch.zeros(self.num_experts, device=x.device)
+        tokens_per_expert.scatter_add_(
+            0, top1_indices, torch.ones(num_tokens, device=x.device)
+        )
+        f = tokens_per_expert / num_tokens  # (num_experts,)
+        P = probs.mean(dim=0)               # (num_experts,)
+        aux_loss = self.num_experts * (f * P).sum()
+
+        return top_k_weights, top_k_indices, aux_loss
+
+
+class SparseMoE(nn.Module):
+    """Sparse Mixture-of-Experts layer (pure PyTorch, no DeepSpeed dependency).
+
+    Each expert is an independent FFN. A top-k router selects which experts process
+    each token. The outputs are combined via the gating weights.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = getattr(config, "num_experts_total", 1)
+        self.top_k = getattr(config, "num_experts_activated", 1)
+        self.hidden_size = config.n_embd
+
+        self.router = TopKRouter(self.hidden_size, self.num_experts, self.top_k)
+        self.experts = nn.ModuleList([_build_ffn(config) for _ in range(self.num_experts)])
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Args:
+            x: (batch, seq_len, hidden_size)
+        Returns:
+            output: (batch, seq_len, hidden_size)
+            aux_loss: scalar
+        """
+        batch_size, seq_len, hidden_size = x.shape
+        x_flat = x.view(-1, hidden_size)  # (B*T, H)
+
+        # Route
+        top_k_weights, top_k_indices, aux_loss = self.router(x_flat)  # (B*T, k), (B*T, k)
+
+        # Compute expert outputs — gather tokens for each expert for efficiency
+        output = torch.zeros_like(x_flat)  # (B*T, H)
+        for expert_idx in range(self.num_experts):
+            # Mask: which (token, slot) pairs selected this expert
+            mask = (top_k_indices == expert_idx)  # (B*T, k)
+            if not mask.any():
+                continue
+            # Get the token indices that route to this expert (any of the k slots)
+            token_mask = mask.any(dim=-1)  # (B*T,)
+            expert_input = x_flat[token_mask]  # (n, H)
+            expert_output = self.experts[expert_idx](expert_input)  # (n, H)
+            # Weight by the routing weights for this expert across all slots
+            # Sum the weights across slots that selected this expert
+            weights = (top_k_weights * mask.float()).sum(dim=-1)  # (B*T,)
+            expert_weights = weights[token_mask].unsqueeze(-1)    # (n, 1)
+            output[token_mask] += expert_output * expert_weights
+
+        output = output.view(batch_size, seq_len, hidden_size)
+        return output, aux_loss
+
+
 class Block(nn.Module):
     def __init__(self, config, attention_weights: list | None = None):
         super().__init__()
@@ -127,26 +224,9 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd, bias=config.bias)
 
         num_experts = getattr(config, "num_experts_total", 1)
-        num_experts_activated = getattr(config, "num_experts_activated", 1)
 
         if num_experts > 1:
-            from deepspeed.moe.layer import MoE
-
-            expert = _build_ffn(config)
-            self.moe = MoE(
-                hidden_size=config.n_embd,
-                expert=expert,
-                num_experts=num_experts,
-                ep_size=1,  # will be overridden by DeepSpeed engine when distributed
-                k=num_experts_activated,
-                use_residual=False,
-                capacity_factor=1.0,
-                eval_capacity_factor=1.0,
-                min_capacity=4,
-                drop_tokens=True,
-                use_tutel=False,
-                noisy_gate_policy=None,
-            )
+            self.moe = SparseMoE(config)
             self.use_moe = True
         else:
             self.mlp = _build_ffn(config)
@@ -157,9 +237,7 @@ class Block(nn.Module):
         residual = x
         x = self.ln_2(x)
         if self.use_moe:
-            # DeepSpeed MoE expects (batch*seq, hidden) or (batch, seq, hidden)
-            # It returns (output, moe_loss, _)
-            x, moe_loss, _ = self.moe(x)
+            x, moe_loss = self.moe(x)
             x = residual + x
             return x, moe_loss
         else:
@@ -232,22 +310,21 @@ class GPT2LMNoBiasModel(nn.Module):
         num_experts = getattr(self.config, "num_experts_total", 1)
         num_activated = getattr(self.config, "num_experts_activated", 1)
 
-        # Sum non-expert parameters
-        expert_params_per_layer = 0
+        # Separate expert parameters from non-expert parameters
+        expert_params_total = 0
         non_expert_params = 0
         for name, p in self.named_parameters():
-            if ".moe." in name and ".deepspeed_moe.experts." in name:
-                # This is an expert parameter; count per-layer once
-                expert_params_per_layer += p.numel()
+            if ".moe.experts." in name:
+                expert_params_total += p.numel()
             else:
                 non_expert_params += p.numel()
 
         if exclude_embeddings:
             non_expert_params -= self.transformer.wpe.weight.numel()
 
-        # expert_params_per_layer counts ALL expert params across ALL layers
-        # Each layer has num_experts copies; activated params = total_expert / num_experts * num_activated
-        active_expert_params = expert_params_per_layer // num_experts * num_activated
+        # expert_params_total counts ALL expert params across ALL layers.
+        # Each layer has num_experts copies; active = total / num_experts * num_activated
+        active_expert_params = expert_params_total // num_experts * num_activated
 
         return non_expert_params + active_expert_params
 

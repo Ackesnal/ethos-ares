@@ -183,13 +183,9 @@ def main(cfg: DictConfig):
         optimizer.load_state_dict(optimizer_state)
 
     num_params = num_params_active
-    # Disable torch.compile when using MoE (DeepSpeed MoE is not compatible with torch.compile)
-    no_compile = cfg.no_compile or use_moe
     if master_process:
-        if use_moe and not cfg.no_compile:
-            logger.info("Disabling torch.compile because MoE is enabled.")
-        logger.info(("Not c" if no_compile else "C") + "ompiling the model...")
-    model = th.compile(raw_model, disable=no_compile)
+        logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
+    model = th.compile(raw_model, disable=cfg.no_compile)
 
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
