@@ -128,12 +128,16 @@ def main(cfg: DictConfig):
     vocab_size = math.ceil(len(vocab) / 64) * 64
 
     train_dataset, val_dataset = train_dataset.train_test_split(cfg.val_size)
+    _pin_memory = "cuda" in device
     train_dataloader, val_dataloader = (
         DataLoader(
             dataset,
             batch_size=cfg.batch_size,
             shuffle=not ddp,
             sampler=DistributedSampler(dataset) if ddp else None,
+            num_workers=8,
+            pin_memory=_pin_memory,
+            persistent_workers=True,
         )
         for dataset in [train_dataset, val_dataset]
     )
