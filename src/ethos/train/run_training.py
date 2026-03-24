@@ -19,6 +19,24 @@ from .metrics import estimate_loss
 from .utils import ModelType, configure_optimizers, estimate_mfu, get_lr, make_infinite_loader
 
 
+def _convert_to_moe_state_dict(state_dict, num_experts):
+    """Convert a non-MoE model state dict to MoE format.
+
+    Copies backbone FFN weights (``.mlp.``) into every expert
+    (``.moe.experts.{i}.``).  Router weights are left out so they keep
+    their random initialisation in the target model.
+    """
+    moe_state_dict = {}
+    for key, value in state_dict.items():
+        if ".mlp." in key:
+            for expert_idx in range(num_experts):
+                new_key = key.replace(".mlp.", f".moe.experts.{expert_idx}.")
+                moe_state_dict[new_key] = value.clone()
+        else:
+            moe_state_dict[key] = value
+    return moe_state_dict
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="training")
 def main(cfg: DictConfig):
     """This training script can be run both on a single gpu in debug mode, and also in a larger
@@ -75,6 +93,30 @@ def main(cfg: DictConfig):
         logger.info(f"Tokens per iteration per worker: {tokens_per_iter:,}")
         out_dir.mkdir(parents=True, exist_ok=True)
     ctx = setup_torch(device, cfg.dtype, 42 + seed_offset)
+
+    # --- MoE training-mode detection -----------------------------------------
+    original_num_experts = cfg.num_experts_total
+    if original_num_experts < 1:
+        if master_process:
+            logger.info(f"num_experts_total={original_num_experts} < 1, clamping to 1")
+        original_num_experts = 1
+        cfg.num_experts_total = 1
+
+    two_stage_moe = original_num_experts > 1 and not cfg.resume
+    if two_stage_moe:
+        cfg.num_experts_total = 1  # Stage 1 builds a plain (non-MoE) backbone
+        if master_process:
+            logger.info(
+                f"MoE two-stage training enabled ({original_num_experts} experts). "
+                "Stage 1: training backbone without MoE."
+            )
+        if model_type == ModelType.ENC_DECODER:
+            if master_process:
+                logger.warning(
+                    "MoE two-stage training is not supported for encoder-decoder "
+                    "models. Falling back to standard training with num_experts_total=1."
+                )
+            two_stage_moe = False
 
     train_dataset = TimelineDataset(
         cfg.data_fp,
@@ -217,129 +259,246 @@ def main(cfg: DictConfig):
         )
         online_logger = wandb
 
-    # training loop
-    X, Y = get_batch()  # fetch the very first batch
-    t0 = time.time()
-    local_iter_num = 0  # number of iterations in the lifetime of this process
-    running_mfu = -1.0
-    while True:
-        # determine and set the learning rate for this iteration
-        lr = get_lr(iter_num, cfg)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+    # ---- training stage helper (closure over data loaders, cfg, ctx, …) ------
+    def run_training_stage(
+        model,
+        raw_model,
+        optimizer,
+        scaler,
+        use_moe,
+        num_params,
+        start_iter,
+        max_iters_stage,
+        best_val_loss,
+        best_metric_score,
+        lr_scale=1.0,
+        stage_label="",
+    ):
+        """Execute one training stage and return updated *best_val_loss* and *best_metric_score*."""
+        X, Y = get_batch()
+        t0 = time.time()
+        iter_num = start_iter
+        local_iter_num = 0
+        running_mfu = -1.0
+        while True:
+            # determine and set the learning rate for this iteration
+            lr = get_lr(iter_num, cfg) * lr_scale
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-        # evaluate the loss on train/val sets and write checkpoints
-        if iter_num % cfg.eval_interval == 0:
-            losses = estimate_loss(
-                model,
-                ctx,
-                loaders=[("train", train_dataloader), ("val", val_dataloader)],
-                eval_iters=eval_iters,
-            )
-            if ddp:
-                for key in ["loss/train", "loss/val"]:
-                    output = [None] * ddp_world_size
-                    th.distributed.all_gather_object(output, losses[key])
-                    losses[key] = sum(output) / ddp_world_size
-            if master_process:
-                logger.info(
-                    "step {}: train loss {:.4f}, val loss {:.4f}".format(
-                        iter_num,
-                        losses["loss/train"],
-                        losses["loss/val"],
+            # evaluate the loss on train/val sets and write checkpoints
+            if iter_num % cfg.eval_interval == 0:
+                losses = estimate_loss(
+                    model,
+                    ctx,
+                    loaders=[("train", train_dataloader), ("val", val_dataloader)],
+                    eval_iters=eval_iters,
+                )
+                if ddp:
+                    for key in ["loss/train", "loss/val"]:
+                        output = [None] * ddp_world_size
+                        th.distributed.all_gather_object(output, losses[key])
+                        losses[key] = sum(output) / ddp_world_size
+                if master_process:
+                    prefix = f"[{stage_label}] " if stage_label else ""
+                    logger.info(
+                        "{}step {}: train loss {:.4f}, val loss {:.4f}".format(
+                            prefix,
+                            iter_num,
+                            losses["loss/train"],
+                            losses["loss/val"],
+                        )
                     )
+                    if iter_num > 0:
+                        checkpoint = {
+                            "iter_num": iter_num,
+                            "model": raw_model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "best_val_loss": losses["loss/val"],
+                            "best_metric_score": best_metric_score,
+                            "model_config": raw_model.config,
+                            "vocab": vocab.stoi,
+                            "model_type": str(model_type),
+                            "wandb_path": wandb_run.path if wandb_run is not None else None,
+                        }
+                        th.save(checkpoint, out_dir / "recent_model.pt")
+                        logger.info("Saved the most recent model.")
+                        if losses["loss/val"] < best_val_loss:
+                            th.save(checkpoint, out_dir / "best_model.pt")
+                            logger.info(
+                                f"Saved the best model: {best_val_loss} => {losses['loss/val']}"
+                            )
+                            best_val_loss = losses["loss/val"]
+
+                        if online_logger is not None:
+                            epochs = iter_num * tokens_per_iter / len(train_dataset)
+                            online_logger.log(
+                                {
+                                    "other/iter": iter_num,
+                                    "other/lr": lr,
+                                    "other/mfu": running_mfu * 100,
+                                    "other/epochs": epochs,
+                                    **losses,
+                                }
+                            )
+
+            # forward backward update, with optional gradient accumulation
+            for micro_step in range(cfg.gradient_accumulation_steps):
+                if ddp:
+                    model.require_backward_grad_sync = (
+                        micro_step == cfg.gradient_accumulation_steps - 1
+                    )
+                with ctx:
+                    if isinstance(X, tuple):
+                        output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
+                    else:
+                        output = model(input_ids=X, labels=Y)
+                    loss = output.loss
+                    # Add MoE auxiliary load-balancing loss if applicable
+                    if use_moe and hasattr(output, "moe_loss"):
+                        loss = loss + cfg.moe_aux_loss_weight * output.moe_loss
+                    loss = (
+                        loss / cfg.gradient_accumulation_steps
+                    )  # scale the loss to account for gradient accumulation
+                # immediately async prefetch next batch
+                X, Y = get_batch()
+                # backward pass, with gradient scaling if training in fp16
+                scaler.scale(loss).backward()
+            # clip the gradient
+            if cfg.grad_clip != 0.0:
+                scaler.unscale_(optimizer)
+                th.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # step the optimizer and scaler if training in fp16
+            scaler.step(optimizer)
+            scaler.update()
+            # flush the gradients as soon as we can
+            optimizer.zero_grad(set_to_none=True)
+
+            # timing and logging
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+            if iter_num % cfg.log_interval == 0 and master_process:
+                lossf = loss.item() * cfg.gradient_accumulation_steps
+                if local_iter_num >= 5 and model_type == ModelType.DECODER:
+                    mfu = estimate_mfu(
+                        raw_model,
+                        num_params,
+                        cfg.batch_size * cfg.gradient_accumulation_steps,
+                        dt,
+                    )
+                    running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+                prefix = f"{stage_label} " if stage_label else ""
+                logger.info(
+                    f"[{prefix}{iter_num}]: loss={lossf:.4f}, "
+                    f"time={dt * 1000:.0f}ms, mfu={running_mfu:.2%}"
                 )
-                if iter_num > 0:
-                    checkpoint = {
-                        "iter_num": iter_num,
-                        "model": raw_model.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "best_val_loss": losses["loss/val"],
-                        "best_metric_score": best_metric_score,
-                        "model_config": raw_model.config,
-                        "vocab": vocab.stoi,
-                        "model_type": str(model_type),
-                        "wandb_path": wandb_run.path if wandb_run is not None else None,
-                    }
-                    th.save(checkpoint, out_dir / "recent_model.pt")
-                    logger.info("Saved the most recent model.")
-                    if losses["loss/val"] < best_val_loss:
-                        th.save(checkpoint, out_dir / "best_model.pt")
-                        logger.info(
-                            f"Saved the best model: {best_val_loss} => {losses['loss/val']}"
-                        )
-                        best_val_loss = losses["loss/val"]
+            iter_num += 1
+            local_iter_num += 1
 
-                    if online_logger is not None:
-                        epochs = iter_num * tokens_per_iter / len(train_dataset)
-                        online_logger.log(
-                            {
-                                "other/iter": iter_num,
-                                "other/lr": lr,
-                                "other/mfu": running_mfu * 100,
-                                "other/epochs": epochs,
-                                **losses,
-                            }
-                        )
+            # termination conditions
+            if iter_num > max_iters_stage:
+                break
 
-        # forward backward update, with optional gradient accumulation to simulate larger batch size
-        # and using the GradScaler if data type is float16
-        for micro_step in range(cfg.gradient_accumulation_steps):
-            if ddp:
-                # in DDP training we only need to sync gradients at the last micro step.
-                # the official way to do this is with model.no_sync() context manager, but
-                # I really dislike that this bloats the code and forces us to repeat code
-                # looking at the source of that context manager, it just toggles this variable
-                model.require_backward_grad_sync = micro_step == cfg.gradient_accumulation_steps - 1
-            with ctx:
-                if isinstance(X, tuple):
-                    output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
-                else:
-                    output = model(input_ids=X, labels=Y)
-                loss = output.loss
-                # Add MoE auxiliary load-balancing loss if applicable
-                if use_moe and hasattr(output, "moe_loss"):
-                    loss = loss + cfg.moe_aux_loss_weight * output.moe_loss
-                loss = (
-                    loss / cfg.gradient_accumulation_steps
-                )  # scale the loss to account for gradient accumulation
-            # immediately async prefetch next batch while model is doing the forward pass on the GPU
-            X, Y = get_batch()
-            # backward pass, with gradient scaling if training in fp16
-            scaler.scale(loss).backward()
-        # clip the gradient
-        if cfg.grad_clip != 0.0:
-            scaler.unscale_(optimizer)
-            th.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        # step the optimizer and scaler if training in fp16
-        scaler.step(optimizer)
-        scaler.update()
-        # flush the gradients as soon as we can, no need for this memory anymore
-        optimizer.zero_grad(set_to_none=True)
+        return best_val_loss, best_metric_score
 
-        # timing and logging
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        if iter_num % cfg.log_interval == 0 and master_process:
-            # get loss as float. note: this is a CPU-GPU sync point
-            # scale up to undo the division above,
-            # approximating the true total loss (exact would have been a sum)
-            lossf = loss.item() * cfg.gradient_accumulation_steps
-            if local_iter_num >= 5 and model_type == ModelType.DECODER:
-                mfu = estimate_mfu(
-                    raw_model, num_params, cfg.batch_size * cfg.gradient_accumulation_steps, dt
-                )
-                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-            logger.info(
-                f"[{iter_num}]: loss={lossf:.4f}, time={dt * 1000:.0f}ms, mfu={running_mfu:.2%}"
+    # ---- Stage 1 (or vanilla training) --------------------------------------
+    stage_label = "Stage 1" if two_stage_moe else ""
+    best_val_loss, best_metric_score = run_training_stage(
+        model=model,
+        raw_model=raw_model,
+        optimizer=optimizer,
+        scaler=scaler,
+        use_moe=use_moe,
+        num_params=num_params,
+        start_iter=iter_num,
+        max_iters_stage=cfg.max_iters,
+        best_val_loss=best_val_loss,
+        best_metric_score=best_metric_score,
+        stage_label=stage_label,
+    )
+
+    # ---- Stage 2: MoE fine-tuning (only when two_stage_moe) -----------------
+    if two_stage_moe:
+        if master_process:
+            logger.info("Stage 1 complete. Saving backbone and beginning Stage 2 (MoE).")
+            th.save(
+                {
+                    "model": raw_model.state_dict(),
+                    "model_config": raw_model.config,
+                    "vocab": vocab.stoi,
+                },
+                out_dir / "stage1_backbone.pt",
             )
-        iter_num += 1
-        local_iter_num += 1
 
-        # termination conditions
-        if iter_num > cfg.max_iters:
-            break
+        # Capture backbone weights before they are overwritten
+        stage1_state = raw_model.state_dict()
+
+        # Rebuild config with the original number of experts
+        cfg.num_experts_total = original_num_experts
+        moe_config = GPT2Config(
+            vocab_size=vocab_size,
+            n_positions=cfg.n_positions,
+            n_embd=cfg.n_embd,
+            n_layer=cfg.n_layer,
+            n_head=cfg.n_head,
+            n_inner=None,
+            activation_function=cfg.activation,
+            resid_pdrop=cfg.dropout,
+            embd_pdrop=cfg.dropout,
+            attn_pdrop=cfg.dropout,
+            bias=False,
+        )
+        moe_config.ffn_type = cfg.ffn_type
+        moe_config.num_experts_total = original_num_experts
+        moe_config.num_experts_activated = cfg.num_experts_activated
+
+        moe_raw_model = GPT2LMNoBiasModel(moe_config)
+
+        # Load backbone weights — FFN weights are copied into every expert
+        moe_state = _convert_to_moe_state_dict(stage1_state, original_num_experts)
+        moe_raw_model.load_state_dict(moe_state, strict=False)
+
+        # Freeze all non-MoE parameters (attention, embeddings, layer norms, …)
+        for name, param in moe_raw_model.named_parameters():
+            param.requires_grad = ".moe." in name
+
+        moe_raw_model.to(device)
+
+        moe_num_params = moe_raw_model.num_active_parameters()
+        if master_process:
+            n_trainable = sum(p.numel() for p in moe_raw_model.parameters() if p.requires_grad)
+            n_frozen = sum(p.numel() for p in moe_raw_model.parameters() if not p.requires_grad)
+            logger.info(
+                f"Stage 2 — MoE model: active params {moe_num_params / 1e6:.2f}M, "
+                f"trainable {n_trainable / 1e6:.2f}M, frozen {n_frozen / 1e6:.2f}M"
+            )
+
+        moe_scaler = th.amp.GradScaler(enabled=(cfg.dtype == "float16"))
+        moe_optimizer = configure_optimizers(
+            moe_raw_model, cfg.weight_decay, cfg.lr * 0.1, (cfg.beta1, cfg.beta2), device
+        )
+
+        if master_process:
+            logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the MoE model...")
+        moe_model = th.compile(moe_raw_model, disable=cfg.no_compile)
+        if ddp:
+            moe_model = DDP(moe_model, device_ids=[ddp_local_rank])
+
+        best_val_loss, best_metric_score = run_training_stage(
+            model=moe_model,
+            raw_model=moe_raw_model,
+            optimizer=moe_optimizer,
+            scaler=moe_scaler,
+            use_moe=True,
+            num_params=moe_num_params,
+            start_iter=0,
+            max_iters_stage=cfg.max_iters,
+            best_val_loss=1e9,
+            best_metric_score=0,
+            lr_scale=0.1,
+            stage_label="Stage 2",
+        )
 
     if ddp:
         destroy_process_group()
