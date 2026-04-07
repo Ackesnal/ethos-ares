@@ -25,6 +25,10 @@ def _convert_to_moe_state_dict(state_dict, num_experts):
     Copies backbone FFN weights (``.mlp.``) into every expert
     (``.moe.experts.{i}.``).  Router weights are left out so they keep
     their random initialisation in the target model.
+
+    Works for both plain GPT2LMNoBiasModel state dicts *and*
+    EncoderDecoderModel state dicts (where decoder keys are prefixed
+    with ``decoder.``).
     """
     moe_state_dict = {}
     for key, value in state_dict.items():
@@ -35,6 +39,94 @@ def _convert_to_moe_state_dict(state_dict, num_experts):
         else:
             moe_state_dict[key] = value
     return moe_state_dict
+
+
+def _compute_moe_batch_params(cfg, num_experts, device, master_process):
+    """Compute adjusted batch_size and gradient_accumulation_steps for MoE stage 2.
+
+    The MoE model has *num_experts* copies of each FFN layer, which can
+    easily cause an out-of-memory error if the batch size is kept the
+    same as stage 1.  We estimate the memory scale factor from the
+    parameter-count ratio and reduce the batch size accordingly, while
+    increasing gradient accumulation so the effective batch stays the
+    same.
+
+    Returns (new_batch_size, new_gradient_accumulation_steps).
+    """
+    # A rough but practical heuristic: model memory scales linearly
+    # with the number of expert parameters.  In the backbone each layer
+    # has 1 FFN; in the MoE model it has *num_experts* FFNs plus a
+    # small router.  Non-FFN params (attention, embeddings, LN) stay
+    # the same.  Typical GPT-2 blocks have ~2/3 FFN params, so:
+    #   mem_ratio ≈ (1/3 + 2/3 * num_experts) / 1 = 1/3 + 2/3 * E
+    # We add a small safety margin (1.15).
+    ffn_fraction = 2.0 / 3.0
+    non_ffn_fraction = 1.0 - ffn_fraction
+    mem_ratio = non_ffn_fraction + ffn_fraction * num_experts
+    safety_margin = 1.15
+    scale_factor = mem_ratio * safety_margin
+
+    original_batch_size = cfg.batch_size
+    original_grad_accum = cfg.gradient_accumulation_steps
+    effective_batch = original_batch_size * original_grad_accum
+
+    # Scale batch size down (at least 1)
+    new_batch_size = max(1, int(original_batch_size / scale_factor))
+    # Increase gradient accumulation to compensate
+    new_grad_accum = max(1, round(effective_batch / new_batch_size))
+
+    if master_process:
+        logger.info(
+            f"Auto-scaling batch params for MoE Stage 2 (mem_ratio≈{mem_ratio:.2f}): "
+            f"batch_size {original_batch_size}→{new_batch_size}, "
+            f"gradient_accumulation_steps {original_grad_accum}→{new_grad_accum}"
+        )
+
+    return new_batch_size, new_grad_accum
+
+
+def _build_moe_model(cfg, original_num_experts, vocab_size, model_type, train_dataset):
+    """Build a fresh MoE model for Stage 2 (supports both decoder-only and encoder-decoder)."""
+    moe_gpt2_config = GPT2Config(
+        vocab_size=vocab_size,
+        n_positions=cfg.n_positions,
+        n_embd=cfg.n_embd,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        n_inner=None,
+        activation_function=cfg.activation,
+        resid_pdrop=cfg.dropout,
+        embd_pdrop=cfg.dropout,
+        attn_pdrop=cfg.dropout,
+        bias=False,
+    )
+    moe_gpt2_config.ffn_type = cfg.ffn_type
+    moe_gpt2_config.num_experts_total = original_num_experts
+    moe_gpt2_config.num_experts_activated = cfg.num_experts_activated
+
+    if model_type == ModelType.ENC_DECODER:
+        encoder_config = BertConfig(
+            vocab_size=vocab_size,
+            hidden_size=cfg.n_embd,
+            num_hidden_layers=1,
+            num_attention_heads=cfg.n_head,
+            intermediate_size=cfg.n_embd * 4,
+            hidden_act=cfg.activation,
+            hidden_dropout_prob=cfg.dropout,
+            attention_probs_dropout_prob=cfg.dropout,
+            max_position_embeddings=train_dataset.dataset.context_size,
+            max_length=train_dataset.dataset.context_size,
+            is_encoder_decoder=True,
+            use_bfloat16=True,
+        )
+        enc_dec_config = EncoderDecoderConfig.from_encoder_decoder_configs(
+            encoder_config, moe_gpt2_config
+        )
+        moe_model = EncoderDecoderModel(config=enc_dec_config)
+    else:
+        moe_model = GPT2LMNoBiasModel(moe_gpt2_config)
+
+    return moe_model
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="training")
@@ -102,21 +194,17 @@ def main(cfg: DictConfig):
         original_num_experts = 1
         cfg.num_experts_total = 1
 
-    two_stage_moe = original_num_experts > 1 and not cfg.resume
-    if two_stage_moe:
+    two_stage_moe = original_num_experts > 1
+    # When resuming we will detect which stage to enter below; for fresh
+    # runs we always start with a plain backbone in Stage 1.
+    resume_into_stage2 = False
+    if two_stage_moe and not cfg.resume:
         cfg.num_experts_total = 1  # Stage 1 builds a plain (non-MoE) backbone
         if master_process:
             logger.info(
                 f"MoE two-stage training enabled ({original_num_experts} experts). "
                 "Stage 1: training backbone without MoE."
             )
-        if model_type == ModelType.ENC_DECODER:
-            if master_process:
-                logger.warning(
-                    "MoE two-stage training is not supported for encoder-decoder "
-                    "models. Falling back to standard training with num_experts_total=1."
-                )
-            two_stage_moe = False
 
     train_dataset = TimelineDataset(
         cfg.data_fp,
@@ -168,6 +256,26 @@ def main(cfg: DictConfig):
         best_metric_score = checkpoint["best_metric_score"]
         optimizer_state = checkpoint["optimizer"]
         wandb_path = checkpoint["wandb_path"]
+
+        # Detect which stage the checkpoint belongs to
+        saved_stage = checkpoint.get("training_stage", 1)
+        saved_num_experts = checkpoint.get("original_num_experts", 1)
+        if two_stage_moe:
+            if saved_stage == 2:
+                # Resume directly into Stage 2
+                resume_into_stage2 = True
+                if master_process:
+                    logger.info(
+                        f"Resuming into Stage 2 (MoE, {saved_num_experts} experts) "
+                        f"at iter {iter_num}."
+                    )
+            else:
+                # Resume into Stage 1 — ensure backbone (non-MoE) config
+                cfg.num_experts_total = 1
+                if master_process:
+                    logger.info(
+                        f"Resuming into Stage 1 (backbone) at iter {iter_num}."
+                    )
     else:
         config = GPT2Config(
             vocab_size=vocab_size,
@@ -211,30 +319,36 @@ def main(cfg: DictConfig):
 
     use_moe = getattr(raw_model, "use_moe", False)
     num_params_total = raw_model.num_parameters()
-    num_params_active = raw_model.num_active_parameters()
+    if hasattr(raw_model, "num_active_parameters"):
+        num_params_active = raw_model.num_active_parameters()
+    else:
+        num_params_active = num_params_total
     if master_process:
         logger.info(
             f"Model parameters — total: {num_params_total / 1e6:.2f}M, "
             f"active (per token): {num_params_active / 1e6:.2f}M"
         )
 
-    raw_model.to(device)
-    # initialize a GradScaler. If enabled=False scaler is a no-op
-    scaler = th.amp.GradScaler(enabled=(cfg.dtype == "float16"))
-    # optimizer
-    optimizer = configure_optimizers(
-        raw_model, cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), device
-    )
-    if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
+    # When resuming directly into Stage 2, we defer model placement,
+    # compilation, and optimizer creation to the Stage 2 block.
+    if not resume_into_stage2:
+        raw_model.to(device)
+        # initialize a GradScaler. If enabled=False scaler is a no-op
+        scaler = th.amp.GradScaler(enabled=(cfg.dtype == "float16"))
+        # optimizer
+        optimizer = configure_optimizers(
+            raw_model, cfg.weight_decay, cfg.lr, (cfg.beta1, cfg.beta2), device
+        )
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
 
-    num_params = num_params_active
-    if master_process:
-        logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
-    model = th.compile(raw_model, disable=cfg.no_compile)
+        num_params = num_params_active
+        if master_process:
+            logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
+        model = th.compile(raw_model, disable=cfg.no_compile)
 
-    if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+        if ddp:
+            model = DDP(model, device_ids=[ddp_local_rank])
 
     # logging
     online_logger, wandb_run = None, None
@@ -277,8 +391,15 @@ def main(cfg: DictConfig):
         best_metric_score,
         lr_scale=1.0,
         stage_label="",
+        training_stage=1,
+        stage_batch_size=None,
+        stage_grad_accum=None,
     ):
         """Execute one training stage and return updated *best_val_loss* and *best_metric_score*."""
+        # Allow per-stage overrides of batch size / gradient accumulation
+        batch_size = stage_batch_size if stage_batch_size is not None else cfg.batch_size
+        grad_accum = stage_grad_accum if stage_grad_accum is not None else cfg.gradient_accumulation_steps
+
         X, Y = get_batch()
         t0 = time.time()
         iter_num = start_iter
@@ -324,6 +445,8 @@ def main(cfg: DictConfig):
                             "vocab": vocab.stoi,
                             "model_type": str(model_type),
                             "wandb_path": wandb_run.path if wandb_run is not None else None,
+                            "training_stage": training_stage,
+                            "original_num_experts": original_num_experts,
                         }
                         th.save(checkpoint, out_dir / "recent_model.pt")
                         logger.info("Saved the most recent model.")
@@ -335,7 +458,10 @@ def main(cfg: DictConfig):
                             best_val_loss = losses["loss/val"]
 
                         if online_logger is not None:
-                            epochs = iter_num * tokens_per_iter / len(train_dataset)
+                            stage_tokens_per_iter = (
+                                grad_accum * batch_size * cfg.n_positions
+                            )
+                            epochs = iter_num * stage_tokens_per_iter / len(train_dataset)
                             online_logger.log(
                                 {
                                     "other/iter": iter_num,
@@ -347,10 +473,10 @@ def main(cfg: DictConfig):
                             )
 
             # forward backward update, with optional gradient accumulation
-            for micro_step in range(cfg.gradient_accumulation_steps):
+            for micro_step in range(grad_accum):
                 if ddp:
                     model.require_backward_grad_sync = (
-                        micro_step == cfg.gradient_accumulation_steps - 1
+                        micro_step == grad_accum - 1
                     )
                 with ctx:
                     if isinstance(X, tuple):
@@ -362,7 +488,7 @@ def main(cfg: DictConfig):
                     if use_moe and hasattr(output, "moe_loss"):
                         loss = loss + cfg.moe_aux_loss_weight * output.moe_loss
                     loss = (
-                        loss / cfg.gradient_accumulation_steps
+                        loss / grad_accum
                     )  # scale the loss to account for gradient accumulation
                 # immediately async prefetch next batch
                 X, Y = get_batch()
@@ -383,12 +509,12 @@ def main(cfg: DictConfig):
             dt = t1 - t0
             t0 = t1
             if iter_num % cfg.log_interval == 0 and master_process:
-                lossf = loss.item() * cfg.gradient_accumulation_steps
+                lossf = loss.item() * grad_accum
                 if local_iter_num >= 5 and model_type == ModelType.DECODER:
                     mfu = estimate_mfu(
                         raw_model,
                         num_params,
-                        cfg.batch_size * cfg.gradient_accumulation_steps,
+                        batch_size * grad_accum,
                         dt,
                     )
                     running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
@@ -407,61 +533,91 @@ def main(cfg: DictConfig):
         return best_val_loss, best_metric_score
 
     # ---- Stage 1 (or vanilla training) --------------------------------------
-    stage_label = "Stage 1" if two_stage_moe else ""
-    best_val_loss, best_metric_score = run_training_stage(
-        model=model,
-        raw_model=raw_model,
-        optimizer=optimizer,
-        scaler=scaler,
-        use_moe=use_moe,
-        num_params=num_params,
-        start_iter=iter_num,
-        max_iters_stage=cfg.max_iters,
-        best_val_loss=best_val_loss,
-        best_metric_score=best_metric_score,
-        stage_label=stage_label,
-    )
+    if not resume_into_stage2:
+        stage_label = "Stage 1" if two_stage_moe else ""
+        best_val_loss, best_metric_score = run_training_stage(
+            model=model,
+            raw_model=raw_model,
+            optimizer=optimizer,
+            scaler=scaler,
+            use_moe=use_moe,
+            num_params=num_params,
+            start_iter=iter_num,
+            max_iters_stage=cfg.max_iters,
+            best_val_loss=best_val_loss,
+            best_metric_score=best_metric_score,
+            stage_label=stage_label,
+            training_stage=1,
+        )
+    else:
+        if master_process:
+            logger.info("Skipping Stage 1 (resuming directly into Stage 2).")
 
     # ---- Stage 2: MoE fine-tuning (only when two_stage_moe) -----------------
     if two_stage_moe:
-        if master_process:
-            logger.info("Stage 1 complete. Saving backbone and beginning Stage 2 (MoE).")
-            th.save(
-                {
-                    "model": raw_model.state_dict(),
-                    "model_config": raw_model.config,
-                    "vocab": vocab.stoi,
-                },
-                out_dir / "stage1_backbone.pt",
+        # --- Free Stage 1 model memory before building the larger MoE model ---
+        if not resume_into_stage2:
+            if master_process:
+                logger.info("Stage 1 complete. Saving backbone and beginning Stage 2 (MoE).")
+                th.save(
+                    {
+                        "model": raw_model.state_dict(),
+                        "model_config": raw_model.config,
+                        "vocab": vocab.stoi,
+                    },
+                    out_dir / "stage1_backbone.pt",
+                )
+
+            # Capture backbone weights before they are overwritten
+            stage1_state = {k: v.cpu() for k, v in raw_model.state_dict().items()}
+
+            # Free stage 1 model, optimizer, and compiled wrapper from GPU
+            del model, raw_model, optimizer, scaler
+            th.cuda.empty_cache() if "cuda" in device else None
+
+        # Restore the original number of experts in cfg
+        cfg.num_experts_total = original_num_experts
+
+        # --- Auto-scale batch size / gradient accumulation to avoid OOM ---
+        moe_batch_size, moe_grad_accum = _compute_moe_batch_params(
+            cfg, original_num_experts, device, master_process
+        )
+
+        # Rebuild data loaders with the new (smaller) batch size
+        moe_train_dataloader, moe_val_dataloader = (
+            DataLoader(
+                dataset,
+                batch_size=moe_batch_size,
+                shuffle=not ddp,
+                sampler=DistributedSampler(dataset) if ddp else None,
+                num_workers=8,
+                pin_memory=_pin_memory,
+                persistent_workers=True,
+            )
+            for dataset in [train_dataset, val_dataset]
+        )
+        # Replace the infinite loader and val loader used by the closure
+        train_dataloader = make_infinite_loader(moe_train_dataloader)
+        val_dataloader = moe_val_dataloader
+        # Update eval_iters for the new batch size
+        eval_iters = len(val_dataset) // (moe_batch_size * cfg.n_positions) + 1
+
+        if resume_into_stage2:
+            # Resuming: model already loaded from checkpoint
+            moe_raw_model = raw_model
+            moe_optimizer_state = optimizer_state
+        else:
+            # Fresh Stage 2: build MoE model and seed with backbone weights
+            moe_raw_model = _build_moe_model(
+                cfg, original_num_experts, vocab_size, model_type, train_dataset
             )
 
-        # Capture backbone weights before they are overwritten
-        stage1_state = raw_model.state_dict()
+            # Load backbone weights — FFN weights are copied into every expert
+            moe_state = _convert_to_moe_state_dict(stage1_state, original_num_experts)
+            moe_raw_model.load_state_dict(moe_state, strict=False)
+            del stage1_state, moe_state
 
-        # Rebuild config with the original number of experts
-        cfg.num_experts_total = original_num_experts
-        moe_config = GPT2Config(
-            vocab_size=vocab_size,
-            n_positions=cfg.n_positions,
-            n_embd=cfg.n_embd,
-            n_layer=cfg.n_layer,
-            n_head=cfg.n_head,
-            n_inner=None,
-            activation_function=cfg.activation,
-            resid_pdrop=cfg.dropout,
-            embd_pdrop=cfg.dropout,
-            attn_pdrop=cfg.dropout,
-            bias=False,
-        )
-        moe_config.ffn_type = cfg.ffn_type
-        moe_config.num_experts_total = original_num_experts
-        moe_config.num_experts_activated = cfg.num_experts_activated
-
-        moe_raw_model = GPT2LMNoBiasModel(moe_config)
-
-        # Load backbone weights — FFN weights are copied into every expert
-        moe_state = _convert_to_moe_state_dict(stage1_state, original_num_experts)
-        moe_raw_model.load_state_dict(moe_state, strict=False)
+            moe_optimizer_state = None
 
         # Freeze all non-MoE parameters (attention, embeddings, layer norms, …)
         for name, param in moe_raw_model.named_parameters():
@@ -469,7 +625,13 @@ def main(cfg: DictConfig):
 
         moe_raw_model.to(device)
 
-        moe_num_params = moe_raw_model.num_active_parameters()
+        moe_use_moe = getattr(moe_raw_model, "use_moe", False)
+        # For encoder-decoder, the decoder inside has num_active_parameters;
+        # for the wrapper we fall back to num_parameters.
+        if hasattr(moe_raw_model, "num_active_parameters"):
+            moe_num_params = moe_raw_model.num_active_parameters()
+        else:
+            moe_num_params = moe_raw_model.num_parameters()
         if master_process:
             n_trainable = sum(p.numel() for p in moe_raw_model.parameters() if p.requires_grad)
             n_frozen = sum(p.numel() for p in moe_raw_model.parameters() if not p.requires_grad)
@@ -482,6 +644,8 @@ def main(cfg: DictConfig):
         moe_optimizer = configure_optimizers(
             moe_raw_model, cfg.weight_decay, cfg.lr * 0.1, (cfg.beta1, cfg.beta2), device
         )
+        if moe_optimizer_state is not None:
+            moe_optimizer.load_state_dict(moe_optimizer_state)
 
         if master_process:
             logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the MoE model...")
@@ -489,19 +653,23 @@ def main(cfg: DictConfig):
         if ddp:
             moe_model = DDP(moe_model, device_ids=[ddp_local_rank])
 
+        stage2_start_iter = iter_num if resume_into_stage2 else 0
         best_val_loss, best_metric_score = run_training_stage(
             model=moe_model,
             raw_model=moe_raw_model,
             optimizer=moe_optimizer,
             scaler=moe_scaler,
-            use_moe=True,
+            use_moe=moe_use_moe or (original_num_experts > 1),
             num_params=moe_num_params,
-            start_iter=0,
+            start_iter=stage2_start_iter,
             max_iters_stage=cfg.max_iters,
-            best_val_loss=1e9,
-            best_metric_score=0,
+            best_val_loss=best_val_loss if resume_into_stage2 else 1e9,
+            best_metric_score=best_metric_score if resume_into_stage2 else 0,
             lr_scale=0.1,
             stage_label="Stage 2",
+            training_stage=2,
+            stage_batch_size=moe_batch_size,
+            stage_grad_accum=moe_grad_accum,
         )
 
     if ddp:
