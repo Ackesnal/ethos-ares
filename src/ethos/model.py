@@ -272,6 +272,16 @@ class GPT2LMNoBiasModel(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
+        # Continuous relative-time embedding: log(1 + Δt) → n_embd
+        self.time_emb = nn.Sequential(
+            nn.Linear(1, config.n_embd, bias=False),
+            nn.GELU(),
+            nn.Linear(config.n_embd, config.n_embd, bias=False),
+        )
+
+        # Vocab-derived buffers are registered lazily via register_vocab_info()
+        self._vocab_registered = False
+
         # init all weights
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -280,6 +290,141 @@ class GPT2LMNoBiasModel(nn.Module):
 
         pos = torch.arange(0, config.n_positions, dtype=torch.long)
         self.register_buffer("pos", pos, persistent=False)
+
+    # ------------------------------------------------------------------
+    # Vocabulary-aware buffers (token type masks, admission IDs)
+    # ------------------------------------------------------------------
+    def register_vocab_info(self, vocab) -> None:
+        """Register token-type classification buffers derived from *vocab*.
+
+        Must be called once before the first forward pass that uses
+        ``times``.  The buffers are persisted inside ``state_dict`` so
+        they survive checkpoint round-trips.
+        """
+        from .vocabulary import TokenType
+
+        token_types = vocab.get_token_type_tensor()          # (vocab_size,)
+        admission_ids = vocab.get_admission_token_ids()      # (num_admission_tokens,)
+        # Boolean masks indexed by token ID
+        is_value = (token_types == TokenType.VALUE)          # (vocab_size,)
+        is_code = (token_types == TokenType.CODE)            # (vocab_size,)
+        is_admission = (token_types == TokenType.ADMISSION)  # (vocab_size,)
+
+        self.register_buffer("_token_types", token_types, persistent=True)
+        self.register_buffer("_admission_ids", admission_ids, persistent=True)
+        self.register_buffer("_is_value", is_value, persistent=True)
+        self.register_buffer("_is_code", is_code, persistent=True)
+        self.register_buffer("_is_admission", is_admission, persistent=True)
+        self._vocab_registered = True
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _compute_relative_times(tokens, times, is_admission_mask):
+        """Compute per-token relative time (seconds) to the nearest preceding admission.
+
+        Parameters
+        ----------
+        tokens : (B, T) long tensor of token IDs
+        times : (B, T) long/float tensor of absolute timestamps in *microseconds*
+        is_admission_mask : (V,) bool tensor indexed by token ID
+
+        Returns
+        -------
+        rel_times : (B, T) float tensor — relative time in **seconds**
+        """
+        is_adm = is_admission_mask[tokens]  # (B, T)
+        adm_times = torch.where(is_adm, times.float(), float("-inf"))  # (B, T)
+        # cummax along time axis gives the most recent admission time at each position
+        nearest_adm_time, _ = adm_times.cummax(dim=1)  # (B, T)
+        # Relative time in microseconds → seconds.  Before any admission the
+        # value is -inf; we clamp to 0 so log(1 + 0) = 0.
+        rel_us = (times.float() - nearest_adm_time).clamp(min=0.0)
+        return rel_us / 1e6  # → seconds
+
+    def _fuse_embeddings(self, input_ids, times, tok_emb):
+        """Fuse code, value, and relative-time embeddings and remove code tokens.
+
+        For every *value* token (Q1 … Q10) that is immediately preceded
+        by a *code* token, the value embedding is enriched::
+
+            fused_value = value_emb + code_emb + time_emb
+
+        The preceding code token is then **removed** from the sequence.
+        All surviving tokens also receive the relative-time embedding.
+
+        Parameters
+        ----------
+        input_ids : (B, T)
+        times : (B, T)
+        tok_emb : (B, T, C)  — raw token embeddings from ``wte``
+
+        Returns
+        -------
+        fused_emb : (B, T', C)  — with T' <= T
+        labels_mask : (B, T)   — boolean mask of positions kept (for label alignment)
+        """
+        B, T, C = tok_emb.shape
+        device = tok_emb.device
+
+        # --- Relative-time embedding for every token -----------------------
+        rel_times = self._compute_relative_times(
+            input_ids, times, self._is_admission
+        )  # (B, T) in seconds
+        log_rt = torch.log1p(rel_times).unsqueeze(-1)  # (B, T, 1)
+        time_emb = self.time_emb(log_rt)  # (B, T, C)
+
+        # --- Identify code-before-value pairs ------------------------------
+        is_val = self._is_value[input_ids]                    # (B, T)
+        is_cd = self._is_code[input_ids]                      # (B, T)
+
+        # A code token at position t is "absorbed" if position t+1 is a value token
+        absorbed_code = torch.zeros(B, T, dtype=torch.bool, device=device)
+        absorbed_code[:, :-1] = is_cd[:, :-1] & is_val[:, 1:]
+
+        # --- Build fused embeddings ----------------------------------------
+        # For value tokens preceded by a code: add the code's embedding
+        code_contrib = torch.zeros_like(tok_emb)
+        # Shift absorbed_code right by 1 to align with the value position
+        val_with_code = torch.zeros(B, T, dtype=torch.bool, device=device)
+        val_with_code[:, 1:] = absorbed_code[:, :-1]
+        # Gather code embeddings from the preceding position
+        code_positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1) - 1
+        code_positions = code_positions.clamp(min=0)
+        prev_tok_emb = torch.gather(
+            tok_emb, 1, code_positions.unsqueeze(-1).expand(-1, -1, C)
+        )
+        code_contrib[val_with_code] = prev_tok_emb[val_with_code]
+
+        # Fuse: all tokens get time_emb; value tokens additionally get code_emb
+        fused = tok_emb + time_emb + code_contrib  # (B, T, C)
+
+        # --- Remove absorbed code tokens -----------------------------------
+        keep_mask = ~absorbed_code  # (B, T)
+
+        # Determine the maximum kept length across the batch
+        kept_counts = keep_mask.sum(dim=1)  # (B,)
+        T_prime = kept_counts.max().item()
+
+        # Compact the fused embeddings using masked_select + padding
+        # For efficiency, build index tensors
+        batch_indices = []
+        seq_indices = []
+        for b in range(B):
+            kept_idx = keep_mask[b].nonzero(as_tuple=True)[0]
+            pad_len = T_prime - len(kept_idx)
+            if pad_len > 0:
+                # Pad with the last valid index (will be masked out by attention)
+                kept_idx = torch.cat([kept_idx, kept_idx[-1:].expand(pad_len)])
+            batch_indices.append(torch.full((T_prime,), b, device=device))
+            seq_indices.append(kept_idx)
+
+        batch_idx = torch.cat(batch_indices)
+        seq_idx = torch.cat(seq_indices)
+        fused_compact = fused[batch_idx, seq_idx].view(B, T_prime, C)
+
+        return fused_compact, keep_mask
 
     @staticmethod
     def _init_weights(module):
@@ -328,13 +473,46 @@ class GPT2LMNoBiasModel(nn.Module):
 
         return non_expert_params + active_expert_params
 
-    def forward(self, input_ids, labels=None) -> ModelOutput:
+    def forward(self, input_ids, labels=None, times=None) -> ModelOutput:
+        """Forward pass with optional fused (code, value, relative-time) embeddings.
+
+        Parameters
+        ----------
+        input_ids : (B, T) long tensor of token IDs
+        labels : (B, T) long tensor of target token IDs (optional)
+        times : (B, T) long tensor of absolute timestamps in microseconds
+            (optional).  When provided **and** ``register_vocab_info`` has
+            been called, the model fuses code + value + log-relative-time
+            embeddings and removes absorbed code tokens from the sequence.
+        """
         _, t = input_ids.size()
         if self.return_attention:
             self.attention_weights.clear()
 
         tok_emb = self.transformer.wte(input_ids)
-        pos_emb = self.transformer.wpe(self.pos[:t])
+
+        use_fusion = times is not None and self._vocab_registered
+        if use_fusion:
+            tok_emb, keep_mask = self._fuse_embeddings(input_ids, times, tok_emb)
+            t_eff = tok_emb.size(1)
+
+            # Compact labels to match the shorter sequence
+            if labels is not None:
+                B_l = labels.size(0)
+                T_prime = t_eff
+                compact_labels = []
+                for b in range(B_l):
+                    kept_idx = keep_mask[b].nonzero(as_tuple=True)[0]
+                    lbl = labels[b][kept_idx]
+                    pad_len = T_prime - len(lbl)
+                    if pad_len > 0:
+                        lbl = torch.cat([lbl, torch.full((pad_len,), -100, device=lbl.device)])
+                    compact_labels.append(lbl)
+                labels = torch.stack(compact_labels)
+        else:
+            t_eff = t
+
+        pos_emb = self.transformer.wpe(self.pos[:t_eff])
         x = self.transformer.drop(tok_emb + pos_emb)
 
         total_moe_loss = torch.tensor(0.0, device=input_ids.device)
@@ -346,7 +524,9 @@ class GPT2LMNoBiasModel(nn.Module):
 
         if labels is not None:
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+            )
         else:
             logits = self.lm_head(x[:, [-1], :])
             loss = None
@@ -354,8 +534,14 @@ class GPT2LMNoBiasModel(nn.Module):
         return ModelOutput(loss=loss, logits=logits, moe_loss=total_moe_loss)
 
     @torch.no_grad()
-    def get_next_token(self, x: torch.Tensor, return_probs: bool = False, top_k: int | None = None):
-        logits = self(x).logits
+    def get_next_token(
+        self,
+        x: torch.Tensor,
+        times: torch.Tensor | None = None,
+        return_probs: bool = False,
+        top_k: int | None = None,
+    ):
+        logits = self(x, times=times).logits
         logits = logits[:, -1, :]
         if top_k is not None:
             v, _ = torch.topk(logits, min(top_k, logits.size(-1)))

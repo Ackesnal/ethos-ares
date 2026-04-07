@@ -96,14 +96,20 @@ class TimelineDataset(th.utils.data.Dataset):
     def __getitem__(self, idx: int) -> tuple[th.Tensor | tuple, th.Tensor]:
         pt_ctx = self._get_patient_context(idx)
         timeline = self.tokens[idx : idx + self.timeline_size + 1]
+        timeline_times = self.times[idx : idx + self.timeline_size + 1]
 
         if self.is_encoder_decoder:
-            return (pt_ctx, timeline[:-1]), timeline[1:]
+            return (pt_ctx, timeline[:-1], timeline_times[:-1]), timeline[1:]
+
+        # Build a times tensor aligned with the full x sequence.
+        # Static context tokens get the time of the first timeline token.
+        ctx_times = th.full((self.context_size,), timeline_times[0].item(), dtype=timeline_times.dtype)
 
         x = th.cat((pt_ctx, timeline[:-1]))
+        x_times = th.cat((ctx_times, timeline_times[:-1]))
         y = th.cat((pt_ctx, timeline[1:]))
         y[: self.context_size] = -100
-        return x, y
+        return (x, x_times), y
 
     def _get_patient_context(self, idx: int) -> th.Tensor:
         patient_id = self.patient_id_at_idx[idx].item()
@@ -216,16 +222,34 @@ class InferenceDataset(TimelineDataset, abc.ABC):
     def __len__(self) -> int:
         pass
 
-    def __getitem__(self, idx: int) -> th.Tensor | tuple[th.Tensor, th.Tensor]:
+    def __getitem__(self, idx: int):
+        """Return ``(timeline_data, timeline_times)`` for inference.
+
+        For **decoder-only** models:
+            ``timeline_data`` is ``th.cat((pt_ctx, timeline))`` (1-D tensor).
+        For **encoder-decoder** models:
+            ``timeline_data`` is ``(pt_ctx, timeline)`` (tuple of tensors).
+
+        ``timeline_times`` is always a 1-D tensor aligned with the full
+        sequence (including static-context positions for decoder-only).
+        """
         data_start_idx = self.patient_offset_at_idx[idx]
         if idx - data_start_idx + 1 > self.timeline_size:
             data_start_idx = idx + 1 - self.timeline_size
 
         pt_ctx = self._get_patient_context(data_start_idx)
         timeline = self.tokens[data_start_idx : idx + 1]
+        timeline_times = self.times[data_start_idx : idx + 1]
+
         if self.is_encoder_decoder:
-            return (pt_ctx, timeline)
-        return th.cat((pt_ctx, timeline))
+            return (pt_ctx, timeline), timeline_times
+
+        ctx_times = th.full(
+            (len(pt_ctx),), timeline_times[0].item(), dtype=timeline_times.dtype
+        )
+        tokens = th.cat((pt_ctx, timeline))
+        times = th.cat((ctx_times, timeline_times))
+        return tokens, times
 
     def _get_indices_of_stokens(self, stokens: str | Sequence[str]) -> th.Tensor:
         if isinstance(stokens, str):

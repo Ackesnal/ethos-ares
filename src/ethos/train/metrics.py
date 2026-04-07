@@ -21,8 +21,26 @@ def estimate_loss(
         losses = th.empty(eval_iters, device=model.device)
         for i, (X, Y) in zip(range(eval_iters), dataloader):
             with ctx:
-                if isinstance(X, tuple):
-                    output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
+                if isinstance(X, (list, tuple)):
+                    # Encoder-decoder: (encoder_input, decoder_input, [times])
+                    # or decoder-only with times: (tokens, times)
+                    if len(X) == 3:
+                        # Encoder-decoder with times
+                        output = model(
+                            input_ids=X[0], decoder_input_ids=X[1], labels=Y,
+                            decoder_times=X[2],
+                        )
+                    elif len(X) == 2:
+                        # Check if this is (tokens, times) or (encoder, decoder)
+                        # by whether the model is encoder-decoder
+                        if hasattr(model, "config") and getattr(
+                            model.config, "is_encoder_decoder", False
+                        ):
+                            output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
+                        else:
+                            output = model(input_ids=X[0], labels=Y, times=X[1])
+                    else:
+                        output = model(input_ids=X[0], labels=Y)
                 else:
                     output = model(input_ids=X, labels=Y)
                 loss = output.loss

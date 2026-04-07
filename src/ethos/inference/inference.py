@@ -47,14 +47,23 @@ def spawn_inference_worker(
 
     time_limit = th.tensor(dataset.time_limit.total_seconds() * 1e6)
 
-    for timeline, ground_truth in data_loader:
+    for timeline_pack, ground_truth in data_loader:
+        # Unpack timeline data and times --------------------------------
+        # timeline_pack is always (timeline_data, timeline_times) where
+        #   decoder-only:      timeline_data = 1-D token tensor
+        #   encoder-decoder:   timeline_data = (pt_ctx, timeline_tokens)
+        timeline_data, timeline_times = timeline_pack
+
         ctx = None
-        if isinstance(timeline, tuple):
-            ctx, timeline = tuple(t.to(device, non_blocking=True) for t in timeline)
+        if isinstance(timeline_data, tuple):
+            ctx, timeline_data = tuple(t.to(device, non_blocking=True) for t in timeline_data)
             ctx = ctx.repeat(rep_num, 1)
         else:
-            timeline = timeline.to(device, non_blocking=True)
-        timeline = timeline.repeat(rep_num, 1)
+            timeline_data = timeline_data.to(device, non_blocking=True)
+        timeline_times = timeline_times.to(device, non_blocking=True)
+
+        timeline = timeline_data.repeat(rep_num, 1)
+        timeline_times = timeline_times.repeat(rep_num, 1)
 
         gen_token_num, offset = 0, 0
         gen_times = th.zeros(rep_num, dtype=th.float64)
@@ -69,7 +78,8 @@ def spawn_inference_worker(
             else:
                 with autocast_context:
                     next_token, probs = get_next_token(
-                        model, timeline, ctx=ctx, return_probs=True, temperature=temperature
+                        model, timeline, ctx=ctx, times=timeline_times,
+                        return_probs=True, temperature=temperature,
                     )
 
             if generated_tokens is not None:
@@ -78,20 +88,35 @@ def spawn_inference_worker(
             if not offset and timeline.size(1) == max_timeline_size:
                 offset = 1
 
+            # Estimate the time for the newly generated token and extend
+            # timeline_times in lockstep with timeline.
+            new_token = next_token.cpu().view(-1)
+            new_token_time_delta = get_token_time(new_token, vocab)  # μs
+            # Use the last known time + estimated delta as the new token's time
+            last_time = timeline_times[:, -1].float()  # (rep_num,)
+            next_time = (last_time + new_token_time_delta.to(last_time.device)).long()
+            next_time_col = next_time.unsqueeze(1)  # (rep_num, 1)
+
             if ctx is not None:
                 new_timeline = (timeline[:, offset:], next_token)
+                new_times = (timeline_times[:, offset:], next_time_col)
             else:
                 new_timeline = (
                     timeline[:, :ctx_size],
                     timeline[:, ctx_size + offset :],
                     next_token,
                 )
+                new_times = (
+                    timeline_times[:, :ctx_size],
+                    timeline_times[:, ctx_size + offset :],
+                    next_time_col,
+                )
             timeline = th.cat(new_timeline, dim=1)
+            timeline_times = th.cat(new_times, dim=1)
 
             gen_token_num += 1
 
-            new_token = next_token.cpu().view(-1)
-            gen_times += get_token_time(new_token, vocab)
+            gen_times += new_token_time_delta
 
             completed_this_iter = th.isin(new_token, stop_tokens) | (gen_times > time_limit)
 
@@ -144,6 +169,7 @@ def spawn_inference_worker(
 
             not_completed_mask = ~completed_this_iter
             timeline = timeline[not_completed_mask, :]
+            timeline_times = timeline_times[not_completed_mask, :]
             gen_times = gen_times[not_completed_mask]
             if generated_tokens is not None:
                 generated_tokens = [tokens[not_completed_mask, :] for tokens in generated_tokens]

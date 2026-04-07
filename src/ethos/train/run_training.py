@@ -243,8 +243,8 @@ def main(cfg: DictConfig):
     def get_batch() -> tuple[th.Tensor | tuple, th.Tensor]:
         x, y = next(train_dataloader)
         y = y.to(device, non_blocking=True)
-        if isinstance(x, list):
-            return (x[0].to(device, non_blocking=True), x[1].to(device, non_blocking=True)), y
+        if isinstance(x, (list, tuple)):
+            return tuple(xi.to(device, non_blocking=True) for xi in x), y
         return x.to(device, non_blocking=True), y
 
     iter_num, best_val_loss, best_metric_score, optimizer_state, wandb_path = 0, 1e9, 0, None, None
@@ -317,6 +317,10 @@ def main(cfg: DictConfig):
 
         if master_process:
             logger.info(f"Initializing a new model from scratch: {config}")
+
+    # Register vocabulary-derived buffers for fused (code, value, time) embeddings
+    if hasattr(raw_model, "register_vocab_info"):
+        raw_model.register_vocab_info(vocab)
 
     use_moe = getattr(raw_model, "use_moe", False)
     num_params_total = raw_model.num_parameters()
@@ -481,7 +485,22 @@ def main(cfg: DictConfig):
                     )
                 with ctx:
                     if isinstance(X, tuple):
-                        output = model(input_ids=X[0], decoder_input_ids=X[1], labels=Y)
+                        if len(X) == 3:
+                            # Encoder-decoder with times: (encoder_input, decoder_input, times)
+                            output = model(
+                                input_ids=X[0], decoder_input_ids=X[1], labels=Y,
+                                decoder_times=X[2],
+                            )
+                        elif len(X) == 2:
+                            if model_type == ModelType.ENC_DECODER:
+                                output = model(
+                                    input_ids=X[0], decoder_input_ids=X[1], labels=Y
+                                )
+                            else:
+                                # Decoder-only with times: (tokens, times)
+                                output = model(input_ids=X[0], labels=Y, times=X[1])
+                        else:
+                            output = model(input_ids=X[0], labels=Y)
                     else:
                         output = model(input_ids=X, labels=Y)
                     loss = output.loss
@@ -619,6 +638,10 @@ def main(cfg: DictConfig):
             del stage1_state, moe_state
 
             moe_optimizer_state = None
+
+        # Register vocabulary-derived buffers for fused embeddings
+        if hasattr(moe_raw_model, "register_vocab_info"):
+            moe_raw_model.register_vocab_info(vocab)
 
         # Freeze all non-MoE parameters (attention, embeddings, layer norms, …)
         for name, param in moe_raw_model.named_parameters():

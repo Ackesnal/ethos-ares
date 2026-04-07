@@ -41,6 +41,13 @@ def load_model_checkpoint(checkpoint_fp: str | Path, **kwargs) -> tuple[
 
     model.load_state_dict(checkpoint["model"])
 
+    # Restore the _vocab_registered flag when vocab buffers were saved
+    # in the checkpoint (they are persistent buffers added by
+    # register_vocab_info).
+    if hasattr(model, "_vocab_registered") and not model._vocab_registered:
+        if hasattr(model, "_token_types") and model._token_types is not None:
+            model._vocab_registered = True
+
     del checkpoint["model"]
     del checkpoint["model_config"]
     return model, checkpoint

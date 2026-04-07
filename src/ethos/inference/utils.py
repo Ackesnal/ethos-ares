@@ -119,14 +119,15 @@ def get_next_token(
     model,
     x: th.Tensor,
     ctx: th.Tensor | None = None,
+    times: th.Tensor | None = None,
     return_probs: bool = False,
     top_k: int | None = None,
     temperature: float = 1.0,
 ):
     if ctx is not None:
-        logits = model(ctx, decoder_input_ids=x).logits
+        logits = model(ctx, decoder_input_ids=x, labels=None, decoder_times=times).logits
     else:
-        logits = model(x).logits
+        logits = model(x, times=times).logits
     logits = logits[:, -1, :]
     logits /= temperature
 

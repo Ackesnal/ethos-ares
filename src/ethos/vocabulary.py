@@ -3,6 +3,7 @@ import json
 import operator
 from collections.abc import Sequence
 from datetime import timedelta
+from enum import IntEnum
 from pathlib import Path
 from typing import TypeVar
 
@@ -11,6 +12,14 @@ import torch as th
 from loguru import logger
 
 T = TypeVar("T", bound="Vocabulary")
+
+
+class TokenType(IntEnum):
+    """Classification of token types in the vocabulary."""
+    CODE = 0          # Medical event codes (diagnoses, procedures, etc.)
+    VALUE = 1         # Quantile value tokens (Q1, Q2, ..., Q10)
+    TIME_INTERVAL = 2 # Time interval tokens (5m-15m, 1d-2d, etc.)
+    ADMISSION = 3     # Hospital/ICU admission tokens
 
 
 class Vocabulary:
@@ -126,3 +135,41 @@ class Vocabulary:
             ),
             timedelta(0),
         )
+
+    @functools.lru_cache(maxsize=1)
+    def get_token_type_tensor(self) -> th.Tensor:
+        """Return a tensor of shape (vocab_size,) mapping each token ID to its :class:`TokenType`.
+
+        The tensor is indexed by token ID and returns the corresponding
+        :class:`TokenType` value (CODE, VALUE, TIME_INTERVAL, or ADMISSION).
+        """
+        from .constants import SpecialToken as ST
+
+        admission_stokens = {str(ST.ADMISSION), str(ST.ICU_ADMISSION)}
+        quantile_set = set(self.quantile_stokens)
+        try:
+            time_interval_set = set(self.time_interval_stokens)
+        except ValueError:
+            time_interval_set = set()
+
+        token_types = th.full((len(self.stoi),), TokenType.CODE, dtype=th.long)
+        for stoken, token_id in self.stoi.items():
+            if stoken in admission_stokens:
+                token_types[token_id] = TokenType.ADMISSION
+            elif stoken in quantile_set:
+                token_types[token_id] = TokenType.VALUE
+            elif stoken in time_interval_set:
+                token_types[token_id] = TokenType.TIME_INTERVAL
+        return token_types
+
+    @functools.lru_cache(maxsize=1)
+    def get_admission_token_ids(self) -> th.Tensor:
+        """Return a 1-D tensor containing token IDs of admission events."""
+        from .constants import SpecialToken as ST
+
+        ids = []
+        for st in (ST.ADMISSION, ST.ICU_ADMISSION):
+            s = str(st)
+            if s in self.stoi:
+                ids.append(self.stoi[s])
+        return th.tensor(ids, dtype=th.long)
