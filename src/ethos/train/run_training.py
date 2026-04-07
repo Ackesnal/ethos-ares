@@ -5,6 +5,7 @@ from pathlib import Path
 
 import hydra
 import torch as th
+import torch._dynamo
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from torch.distributed import destroy_process_group, init_process_group
@@ -350,6 +351,7 @@ def main(cfg: DictConfig):
         num_params = num_params_active
         if master_process:
             logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
+        torch._dynamo.config.capture_scalar_outputs = True
         model = th.compile(raw_model, disable=cfg.no_compile)
 
         if ddp:
@@ -673,6 +675,7 @@ def main(cfg: DictConfig):
 
         if master_process:
             logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the MoE model...")
+        torch._dynamo.config.capture_scalar_outputs = True
         moe_model = th.compile(moe_raw_model, disable=cfg.no_compile)
         if ddp:
             moe_model = DDP(moe_model, device_ids=[ddp_local_rank])
