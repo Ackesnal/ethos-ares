@@ -63,7 +63,7 @@ def _compute_moe_batch_params(cfg, num_experts, device, master_process):
     ffn_fraction = 2.0 / 3.0
     non_ffn_fraction = 1.0 - ffn_fraction
     mem_ratio = non_ffn_fraction + ffn_fraction * num_experts
-    safety_margin = 1.15
+    safety_margin = 0.8 # 1.15
     scale_factor = mem_ratio * safety_margin
 
     original_batch_size = cfg.batch_size
