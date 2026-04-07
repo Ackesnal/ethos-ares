@@ -344,20 +344,21 @@ class GPT2LMNoBiasModel(nn.Module):
         return rel_us / 1e6  # → seconds
 
     def _fuse_embeddings(self, input_ids, times, tok_emb):
-        """Fuse code, value, and relative-time embeddings.
+        """Fuse code, value, and relative-time embeddings and remove absorbed code tokens.
 
         For every *value* token (Q1 … Q10) that is immediately preceded
         by a *code* token, the value embedding is enriched::
 
             fused_value = value_emb + code_emb + time_emb
 
-        Absorbed code positions are zeroed out and their labels should
-        be set to ``-100`` so they do not contribute to the loss.
-        All surviving tokens also receive the relative-time embedding.
+        The preceding code token is then **removed** from the sequence,
+        reducing the effective length from T to T' (<= T).  All surviving
+        tokens also receive the relative-time embedding.
 
-        The implementation is fully vectorised (no ``.item()``,
-        ``.nonzero()``, or Python loops) so it is ``torch.compile``
-        friendly.
+        The compaction is implemented via ``argsort`` + ``gather`` (no
+        ``.nonzero()``, no boolean fancy indexing, no Python loops) so
+        it is ``torch.compile`` friendly.  The only graph break is a
+        single ``.item()`` call to materialise ``T'``.
 
         Parameters
         ----------
@@ -367,8 +368,10 @@ class GPT2LMNoBiasModel(nn.Module):
 
         Returns
         -------
-        fused_emb : (B, T, C)
-        keep_mask : (B, T)   — False at absorbed-code positions
+        fused_emb : (B, T', C)  — with T' <= T (absorbed codes removed)
+        compact_idx : (B, T)    — argsort indices (for aligning labels)
+        kept_counts : (B,)      — number of kept tokens per sample
+        T_prime : int           — max kept length across the batch
         """
         B, T, C = tok_emb.shape
         device = tok_emb.device
@@ -403,11 +406,22 @@ class GPT2LMNoBiasModel(nn.Module):
         # Fuse: all tokens get time_emb; value-after-code tokens also get code_emb
         fused = tok_emb + time_emb + code_contrib  # (B, T, C)
 
-        # Zero out absorbed code positions so they contribute minimally
-        fused = torch.where(absorbed_code.unsqueeze(-1), torch.zeros_like(fused), fused)
+        # --- Compact: remove absorbed code tokens --------------------------
+        # Stable argsort on absorbed_code (0=kept, 1=absorbed) pushes kept
+        # tokens to the front while preserving their relative order.
+        sort_keys = absorbed_code.to(torch.int32)  # 0 for kept, 1 for absorbed
+        compact_idx = torch.argsort(sort_keys, dim=1, stable=True)  # (B, T)
 
-        keep_mask = ~absorbed_code  # (B, T)
-        return fused, keep_mask
+        fused_compact = torch.gather(
+            fused, 1, compact_idx.unsqueeze(-1).expand(-1, -1, C)
+        )  # (B, T, C) — kept tokens packed to the front
+
+        kept_counts = (~absorbed_code).sum(dim=1)  # (B,)
+        T_prime = kept_counts.max().item()  # single graph break
+
+        fused_compact = fused_compact[:, :T_prime, :]  # (B, T', C)
+
+        return fused_compact, compact_idx, kept_counts, T_prime
 
     @staticmethod
     def _init_weights(module):
@@ -471,17 +485,22 @@ class GPT2LMNoBiasModel(nn.Module):
         _, t = input_ids.size()
         if self.return_attention:
             self.attention_weights.clear()
-
+        
         tok_emb = self.transformer.wte(input_ids)
 
         use_fusion = times is not None and self._vocab_registered
         if use_fusion:
-            tok_emb, keep_mask = self._fuse_embeddings(input_ids, times, tok_emb)
-            t_eff = tok_emb.size(1)
+            tok_emb, compact_idx, kept_counts, T_prime = self._fuse_embeddings(
+                input_ids, times, tok_emb
+            )
+            t_eff = T_prime
 
-            # Mask labels at absorbed-code positions so they don't affect the loss
+            # Compact labels to match the shorter sequence
             if labels is not None:
-                labels = torch.where(keep_mask, labels, -100)
+                labels = torch.gather(labels, 1, compact_idx)[:, :T_prime]
+                # Positions beyond each sample's kept count are padding → ignore
+                arange = torch.arange(T_prime, device=labels.device).unsqueeze(0)
+                labels = labels.masked_fill(arange >= kept_counts.unsqueeze(1), -100)
         else:
             t_eff = t
 
