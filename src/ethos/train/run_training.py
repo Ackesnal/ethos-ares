@@ -70,8 +70,9 @@ def _compute_moe_batch_params(cfg, num_experts, device, master_process):
     original_grad_accum = cfg.gradient_accumulation_steps
     effective_batch = original_batch_size * original_grad_accum
 
-    # Scale batch size down (at least 1)
+    # Scale batch size down (at least 1) to the exponential of 2
     new_batch_size = max(1, int(original_batch_size / scale_factor))
+    new_batch_size = 2 ** int(math.log2(new_batch_size))
     # Increase gradient accumulation to compensate
     new_grad_accum = max(1, round(effective_batch / new_batch_size))
 
