@@ -322,7 +322,7 @@ class GPT2LMNoBiasModel(nn.Module):
     # ------------------------------------------------------------------
     @staticmethod
     def _compute_relative_times(tokens, times, is_admission_mask):
-        """Compute per-token relative time (seconds) to the nearest preceding admission.
+        """Compute per-token relative time (hours) to the nearest preceding admission.
 
         Parameters
         ----------
@@ -332,16 +332,20 @@ class GPT2LMNoBiasModel(nn.Module):
 
         Returns
         -------
-        rel_times : (B, T) float tensor — relative time in **seconds**
+        rel_times : (B, T) float tensor — relative time in **hours**
         """
         is_adm = is_admission_mask[tokens]  # (B, T)
         adm_times = torch.where(is_adm, times.float(), float("-inf"))  # (B, T)
         # cummax along time axis gives the most recent admission time at each position
         nearest_adm_time, _ = adm_times.cummax(dim=1)  # (B, T)
-        # Relative time in microseconds → seconds.  Before any admission the
+        # Relative time in microseconds → hours.  Before any admission the
         # value is -inf; we clamp to 0 so log(1 + 0) = 0.
         rel_us = (times.float() - nearest_adm_time).clamp(min=0.0)
-        return rel_us / 1e6  # → seconds
+        rel_us / 1e6 // 3600 # → hours
+        # Set "inf" to -1, representing tokens that occur before the first admission.  This allows the
+        # model to learn a distinct embedding for "pre-admission" tokens if that is useful.
+        rel_us = torch.where(nearest_adm_time == float("-inf"), torch.tensor(-1.0, device=times.device), rel_us)
+        return rel_us
 
     def _fuse_embeddings(self, input_ids, times, tok_emb):
         """Fuse code, value, and relative-time embeddings and remove absorbed code tokens.
@@ -379,9 +383,9 @@ class GPT2LMNoBiasModel(nn.Module):
         # --- Relative-time embedding for every token -----------------------
         rel_times = self._compute_relative_times(
             input_ids, times, self._is_admission
-        )  # (B, T) in seconds
-        log_rt = torch.log1p(rel_times).unsqueeze(-1)  # (B, T, 1)
-        time_emb = self.time_emb(log_rt)  # (B, T, C)
+        )  # (B, T) in hours
+        rel_times = rel_times.unsqueeze(-1)  # (B, T, 1)
+        time_emb = self.time_emb(rel_times)  # (B, T, C)
 
         # --- Identify code-before-value pairs ------------------------------
         is_val = self._is_value[input_ids]                    # (B, T)
