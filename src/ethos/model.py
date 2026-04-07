@@ -344,15 +344,20 @@ class GPT2LMNoBiasModel(nn.Module):
         return rel_us / 1e6  # → seconds
 
     def _fuse_embeddings(self, input_ids, times, tok_emb):
-        """Fuse code, value, and relative-time embeddings and remove code tokens.
+        """Fuse code, value, and relative-time embeddings.
 
         For every *value* token (Q1 … Q10) that is immediately preceded
         by a *code* token, the value embedding is enriched::
 
             fused_value = value_emb + code_emb + time_emb
 
-        The preceding code token is then **removed** from the sequence.
+        Absorbed code positions are zeroed out and their labels should
+        be set to ``-100`` so they do not contribute to the loss.
         All surviving tokens also receive the relative-time embedding.
+
+        The implementation is fully vectorised (no ``.item()``,
+        ``.nonzero()``, or Python loops) so it is ``torch.compile``
+        friendly.
 
         Parameters
         ----------
@@ -362,8 +367,8 @@ class GPT2LMNoBiasModel(nn.Module):
 
         Returns
         -------
-        fused_emb : (B, T', C)  — with T' <= T
-        labels_mask : (B, T)   — boolean mask of positions kept (for label alignment)
+        fused_emb : (B, T, C)
+        keep_mask : (B, T)   — False at absorbed-code positions
         """
         B, T, C = tok_emb.shape
         device = tok_emb.device
@@ -383,48 +388,26 @@ class GPT2LMNoBiasModel(nn.Module):
         absorbed_code = torch.zeros(B, T, dtype=torch.bool, device=device)
         absorbed_code[:, :-1] = is_cd[:, :-1] & is_val[:, 1:]
 
-        # --- Build fused embeddings ----------------------------------------
-        # For value tokens preceded by a code: add the code's embedding
-        code_contrib = torch.zeros_like(tok_emb)
-        # Shift absorbed_code right by 1 to align with the value position
+        # --- Build fused embeddings (compile-friendly, no boolean indexing) -
+        # Value positions preceded by an absorbed code token
         val_with_code = torch.zeros(B, T, dtype=torch.bool, device=device)
         val_with_code[:, 1:] = absorbed_code[:, :-1]
-        # Gather code embeddings from the preceding position
-        code_positions = torch.arange(T, device=device).unsqueeze(0).expand(B, -1) - 1
-        code_positions = code_positions.clamp(min=0)
-        prev_tok_emb = torch.gather(
-            tok_emb, 1, code_positions.unsqueeze(-1).expand(-1, -1, C)
-        )
-        code_contrib[val_with_code] = prev_tok_emb[val_with_code]
 
-        # Fuse: all tokens get time_emb; value tokens additionally get code_emb
+        # Preceding-token embeddings via a simple shift
+        prev_tok_emb = torch.cat([tok_emb[:, :1, :], tok_emb[:, :-1, :]], dim=1)
+        # Add preceding code embedding only where a value follows a code
+        code_contrib = torch.where(
+            val_with_code.unsqueeze(-1), prev_tok_emb, torch.zeros_like(tok_emb)
+        )
+
+        # Fuse: all tokens get time_emb; value-after-code tokens also get code_emb
         fused = tok_emb + time_emb + code_contrib  # (B, T, C)
 
-        # --- Remove absorbed code tokens -----------------------------------
+        # Zero out absorbed code positions so they contribute minimally
+        fused = torch.where(absorbed_code.unsqueeze(-1), torch.zeros_like(fused), fused)
+
         keep_mask = ~absorbed_code  # (B, T)
-
-        # Determine the maximum kept length across the batch
-        kept_counts = keep_mask.sum(dim=1)  # (B,)
-        T_prime = kept_counts.max().item()
-
-        # Compact the fused embeddings using masked_select + padding
-        # For efficiency, build index tensors
-        batch_indices = []
-        seq_indices = []
-        for b in range(B):
-            kept_idx = keep_mask[b].nonzero(as_tuple=True)[0]
-            pad_len = T_prime - len(kept_idx)
-            if pad_len > 0:
-                # Pad with the last valid index (will be masked out by attention)
-                kept_idx = torch.cat([kept_idx, kept_idx[-1:].expand(pad_len)])
-            batch_indices.append(torch.full((T_prime,), b, device=device))
-            seq_indices.append(kept_idx)
-
-        batch_idx = torch.cat(batch_indices)
-        seq_idx = torch.cat(seq_indices)
-        fused_compact = fused[batch_idx, seq_idx].view(B, T_prime, C)
-
-        return fused_compact, keep_mask
+        return fused, keep_mask
 
     @staticmethod
     def _init_weights(module):
@@ -496,19 +479,9 @@ class GPT2LMNoBiasModel(nn.Module):
             tok_emb, keep_mask = self._fuse_embeddings(input_ids, times, tok_emb)
             t_eff = tok_emb.size(1)
 
-            # Compact labels to match the shorter sequence
+            # Mask labels at absorbed-code positions so they don't affect the loss
             if labels is not None:
-                B_l = labels.size(0)
-                T_prime = t_eff
-                compact_labels = []
-                for b in range(B_l):
-                    kept_idx = keep_mask[b].nonzero(as_tuple=True)[0]
-                    lbl = labels[b][kept_idx]
-                    pad_len = T_prime - len(lbl)
-                    if pad_len > 0:
-                        lbl = torch.cat([lbl, torch.full((pad_len,), -100, device=lbl.device)])
-                    compact_labels.append(lbl)
-                labels = torch.stack(compact_labels)
+                labels = torch.where(keep_mask, labels, -100)
         else:
             t_eff = t
 
