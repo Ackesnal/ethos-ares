@@ -63,7 +63,7 @@ def _compute_moe_batch_params(cfg, num_experts, device, master_process):
     ffn_fraction = 2.0 / 3.0
     non_ffn_fraction = 1.0 - ffn_fraction
     mem_ratio = non_ffn_fraction + ffn_fraction * num_experts
-    safety_margin = 0.8 # 1.15
+    safety_margin = 1.1
     scale_factor = mem_ratio * safety_margin
 
     original_batch_size = cfg.batch_size
@@ -72,7 +72,7 @@ def _compute_moe_batch_params(cfg, num_experts, device, master_process):
 
     # Scale batch size down (at least 1) to the exponential of 2
     new_batch_size = max(1, int(original_batch_size / scale_factor))
-    new_batch_size = 2 ** int(math.log2(new_batch_size))
+    new_batch_size = 2 ** math.ceil(math.log2(new_batch_size))
     # Increase gradient accumulation to compensate
     new_grad_accum = max(1, round(effective_batch / new_batch_size))
 
