@@ -341,7 +341,7 @@ class GPT2LMNoBiasModel(nn.Module):
         # Relative time in microseconds → hours.  Before any admission the
         # value is -inf; we clamp to 0 so log(1 + 0) = 0.
         rel_us = (times.float() - nearest_adm_time).clamp(min=0.0)
-        rel_us = rel_us / 1e6 // 3600 # → hours
+        rel_us = rel_us / 1e6 / 3600  # → hours (true division preserves sub-hour resolution)
         # Set "inf" to -1, representing tokens that occur before the first admission.  This allows the
         # model to learn a distinct embedding for "pre-admission" tokens if that is useful.
         rel_us = torch.where(nearest_adm_time == float("-inf"), torch.tensor(-1.0, device=times.device), rel_us)
@@ -384,6 +384,10 @@ class GPT2LMNoBiasModel(nn.Module):
         rel_times = self._compute_relative_times(
             input_ids, times, self._is_admission
         )  # (B, T) in hours
+        # Apply log(1 + Δt) to compress dynamic range (0-8000h → 0-3) so that
+        # time_emb output magnitude matches tok_emb at initialization.
+        # Pre-admission tokens (rel_times == -1) are kept as-is.
+        rel_times = torch.where(rel_times >= 0, torch.log1p(rel_times), rel_times)
         rel_times = rel_times.unsqueeze(-1)  # (B, T, 1)
         time_emb = self.time_emb(rel_times)  # (B, T, C)
 
