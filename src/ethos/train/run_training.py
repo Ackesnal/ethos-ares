@@ -350,6 +350,7 @@ def main(cfg: DictConfig):
         num_params = num_params_active
         if master_process:
             logger.info(("Not c" if cfg.no_compile else "C") + "ompiling the model...")
+        th._dynamo.config.capture_scalar_outputs = True
         model = th.compile(raw_model, disable=cfg.no_compile)
 
         if ddp:

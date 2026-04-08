@@ -3,6 +3,7 @@ from collections import namedtuple
 from functools import lru_cache
 
 import torch
+import torch._dynamo
 import torch.nn as nn
 import transformers.activations
 from torch.nn import functional as F
@@ -425,7 +426,7 @@ class GPT2LMNoBiasModel(nn.Module):
         )  # (B, T, C) — kept tokens packed to the front
 
         kept_counts = (~absorbed_code).sum(dim=1)  # (B,)
-        T_prime = kept_counts.max().item()  # single graph break
+        T_prime = kept_counts.max().item()
 
         fused_compact = fused_compact[:, :T_prime, :]  # (B, T', C)
 
@@ -501,7 +502,7 @@ class GPT2LMNoBiasModel(nn.Module):
             tok_emb, compact_idx, kept_counts, T_prime = self._fuse_embeddings(
                 input_ids, times, tok_emb
             )
-            t_eff = T_prime
+            t = T_prime
 
             # Rebuild labels for the compacted sequence: the correct target
             # at position i is the token at compacted position i+1.
@@ -521,10 +522,8 @@ class GPT2LMNoBiasModel(nn.Module):
                 # Mask positions beyond each sample's kept count (padding)
                 arange = torch.arange(T_prime, device=labels.device).unsqueeze(0)
                 labels = labels.masked_fill(arange >= kept_counts.unsqueeze(1), -100)
-        else:
-            t_eff = t
 
-        pos_emb = self.transformer.wpe(self.pos[:t_eff])
+        pos_emb = self.transformer.wpe(self.pos[:t])
         x = self.transformer.drop(tok_emb + pos_emb)
 
         total_moe_loss = torch.tensor(0.0, device=input_ids.device)
