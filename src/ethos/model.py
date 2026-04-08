@@ -341,7 +341,7 @@ class GPT2LMNoBiasModel(nn.Module):
         # Relative time in microseconds → hours.  Before any admission the
         # value is -inf; we clamp to 0 so log(1 + 0) = 0.
         rel_us = (times.float() - nearest_adm_time).clamp(min=0.0)
-        rel_us / 1e6 // 3600 # → hours
+        rel_us = rel_us / 1e6 // 3600 # → hours
         # Set "inf" to -1, representing tokens that occur before the first admission.  This allows the
         # model to learn a distinct embedding for "pre-admission" tokens if that is useful.
         rel_us = torch.where(nearest_adm_time == float("-inf"), torch.tensor(-1.0, device=times.device), rel_us)
@@ -499,10 +499,22 @@ class GPT2LMNoBiasModel(nn.Module):
             )
             t_eff = T_prime
 
-            # Compact labels to match the shorter sequence
+            # Rebuild labels for the compacted sequence: the correct target
+            # at position i is the token at compacted position i+1.
+            # (Gathering original labels would point to absorbed CODE tokens
+            # that no longer exist in the compacted sequence.)
             if labels is not None:
-                labels = torch.gather(labels, 1, compact_idx)[:, :T_prime]
-                # Positions beyond each sample's kept count are padding → ignore
+                compact_ids = torch.gather(input_ids, 1, compact_idx)[:, :T_prime]
+                # Preserve context masking (-100) from the original labels
+                orig_labels_compact = torch.gather(labels, 1, compact_idx)[:, :T_prime]
+                # Shift compacted token IDs to build next-token labels
+                labels = torch.cat([
+                    compact_ids[:, 1:],
+                    compact_ids.new_full((compact_ids.size(0), 1), -100),
+                ], dim=1)
+                # Re-apply context masking (first context_size tokens → -100)
+                labels = labels.masked_fill(orig_labels_compact == -100, -100)
+                # Mask positions beyond each sample's kept count (padding)
                 arange = torch.arange(T_prime, device=labels.device).unsqueeze(0)
                 labels = labels.masked_fill(arange >= kept_counts.unsqueeze(1), -100)
         else:
