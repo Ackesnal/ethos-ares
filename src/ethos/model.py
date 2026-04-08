@@ -3,7 +3,6 @@ from collections import namedtuple
 from functools import lru_cache
 
 import torch
-import torch._dynamo
 import torch.nn as nn
 import transformers.activations
 from torch.nn import functional as F
